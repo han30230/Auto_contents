@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Build
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Config (민감정보)
+.env
+*_config.json
+*_cookies.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

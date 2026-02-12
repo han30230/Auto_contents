@@ -161,11 +161,7 @@ def naver_login(
 ) -> None:
     """
     네이버에 로그인합니다.
-
-    manual=True 이면 로그인 페이지만 열고, 사용자가 직접 로그인(캡차 등 처리) 후
-    manual_login_event.set() 또는 콘솔 Enter로 다음 단계 진행.
-
-    manual=False 이면 ID/PW를 자동 입력합니다.
+    manual=True이고 manual_login_event가 있으면 이벤트가 set될 때까지 대기 (GUI용).
     """
     driver.get("https://nid.naver.com/nidlogin.login")
     wait = WebDriverWait(driver, 20)
@@ -283,7 +279,7 @@ def fill_post_and_publish(
         cancel_btn = driver.find_element(By.CSS_SELECTOR, ".se-popup-button-cancel")
         cancel_btn.click()
         time.sleep(0.3)
-        
+
     except Exception:
         # 취소 버튼 없으면 도움말 패널(.se-help-panel-close-button) 닫기
         try:
@@ -355,18 +351,56 @@ def fill_post_and_publish(
     time.sleep(5)
 
 
+def main():
+    """
+    네이버 블로그 핫이슈 글 자동 생성 + 발행 진입점.
+    """
+    cfg = load_config()
+    client = create_openai_client(cfg.openai_api_key)
+
+    # 필요하면 topic 을 직접 지정 가능 (예: "테슬라 주가 급등 이슈")
+    # topic = "원하는 이슈 직접 지정"
+    topic = None
+
+    print("GPT로 블로그 글을 생성 중입니다...")
+    title, content = generate_hot_issue_post(client, topic=topic)
+    print("제목:", title)
+    print("본문 일부 미리보기:\n", content[:200], "...\n")
+
+    driver = create_driver()
+    try:
+        if cfg.manual_login:
+            print("수동 로그인 모드: 브라우저에서 직접 로그인해 주세요.")
+        else:
+            print("네이버에 로그인 중입니다...")
+        naver_login(driver, cfg, manual=cfg.manual_login)
+
+        # blog_id 가 NAVER_ID 와 같지 않은 경우 아래를 수정
+        blog_id = cfg.naver_id
+
+        print("블로그 글쓰기 페이지를 여는 중입니다...")
+        open_blog_write_page(driver, blog_id=blog_id)
+
+        action_label = "발행" if cfg.blog_action == "publish" else "저장"
+        print(f"제목/본문을 입력하고 {action_label}까지 시도합니다...")
+        fill_post_and_publish(driver, title=title, content=content, action=cfg.blog_action)
+
+        print("작업이 완료되었습니다. 브라우저 상태를 확인해 주세요.")
+        input("브라우저를 닫으려면 Enter 키를 누르세요...")
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+
 def run_blog_workflow(
     cfg: NaverConfig,
     topic: str | None,
     log_fn: Callable[[str], None] | None = None,
     manual_login_event: threading.Event | None = None,
 ) -> tuple[webdriver.Chrome | None, str | None]:
-    """
-    블로그 글 생성 ~ 저장/발행까지 실행합니다.
-    log_fn: 로그 메시지 콜백 (GUI용).
-    manual_login_event: 수동 로그인 시 이벤트가 set될 때까지 대기.
-    반환: (driver, None) 성공 시 브라우저는 닫지 않고 반환. (None, error_msg) 실패 시.
-    """
+    """블로그 글 생성 ~ 저장/발행. 반환: (driver, None) 성공, (None, error_msg) 실패."""
     def log(msg: str) -> None:
         if log_fn:
             log_fn(msg)
@@ -376,12 +410,10 @@ def run_blog_workflow(
     try:
         client = create_openai_client(cfg.openai_api_key)
         topic_trimmed = topic.strip() if topic else None
-
         log("GPT로 블로그 글을 생성 중입니다...")
         title, content = generate_hot_issue_post(client, topic=topic_trimmed)
         log(f"제목: {title}")
         log(f"본문 일부: {content[:200]}...")
-
         driver = create_driver()
         try:
             if cfg.manual_login:
@@ -389,16 +421,13 @@ def run_blog_workflow(
             else:
                 log("네이버에 로그인 중입니다...")
             naver_login(driver, cfg, manual=cfg.manual_login, manual_login_event=manual_login_event)
-
             blog_id = cfg.naver_id
             log("블로그 글쓰기 페이지를 여는 중입니다...")
             open_blog_write_page(driver, blog_id=blog_id)
-
             action_label = "발행" if cfg.blog_action == "publish" else "저장"
             log(f"제목/본문 입력 후 {action_label} 시도 중...")
             fill_post_and_publish(driver, title=title, content=content, action=cfg.blog_action)
-
-            log("작업이 완료되었습니다. 브라우저를 닫으려면 '브라우저 닫기' 버튼을 누르세요.")
+            log("작업이 완료되었습니다. 브라우저를 닫으려면 '중지' 버튼을 누르세요.")
             return (driver, None)
         except Exception as e:
             try:
@@ -409,29 +438,6 @@ def run_blog_workflow(
     except Exception as e:
         return (None, str(e))
 
-
-def main():
-    """
-    네이버 블로그 핫이슈 글 자동 생성 + 발행 (콘솔 진입점).
-    """
-    cfg = load_config()
-
-    def on_log(msg: str) -> None:
-        print(msg)
-
-    driver, err = run_blog_workflow(cfg, topic=None, log_fn=on_log, manual_login_event=None)
-    if err:
-        print("오류:", err)
-        return
-    if driver:
-        input("브라우저를 닫으려면 Enter 키를 누르세요...")
-        try:
-            driver.quit()
-        except Exception:
-            pass
-
-
-# ---------------------------- GUI ----------------------------
 
 def _gui_config_path() -> Path:
     return Path(__file__).resolve().parent / "gui_config.json"
@@ -453,23 +459,25 @@ def save_gui_config(data: dict) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def main_gui():
+def main_gui() -> None:
     import tkinter as tk
-    from tkinter import ttk, scrolledtext, messagebox
+    from tkinter import scrolledtext, messagebox, font as tkfont
 
     root = tk.Tk()
-    root.title("네이버 블로그 자동 글쓰기")
-    root.geometry("620x580")
-    root.minsize(500, 450)
+    root.title("네이버 블로그 자동 글쓰기 v1.0.0")
+    root.geometry("900x640")
+    root.minsize(780, 560)
+    root.configure(bg="#f0f0f0")
+    GREEN, BLUE, RED = "#2E7D32", "#1976D2", "#C62828"
 
-    # 변수
     var_naver_id = tk.StringVar()
     var_naver_pw = tk.StringVar()
     var_api_key = tk.StringVar()
     var_manual = tk.BooleanVar(value=False)
     var_action = tk.StringVar(value="save")
     var_topic = tk.StringVar()
-
+    var_save_login = tk.BooleanVar(value=True)
+    var_save_api = tk.BooleanVar(value=False)
     cfg = load_gui_config()
     var_naver_id.set(cfg.get("naver_id", ""))
     var_naver_pw.set(cfg.get("naver_pw", ""))
@@ -477,106 +485,90 @@ def main_gui():
     var_manual.set(cfg.get("manual_login", False))
     var_action.set("publish" if cfg.get("blog_action") == "publish" else "save")
     var_topic.set(cfg.get("topic", ""))
-
+    var_save_login.set(cfg.get("save_login", True))
+    var_save_api.set(cfg.get("save_api_key", False))
     current_driver: webdriver.Chrome | None = None
     manual_login_event: threading.Event | None = None
-    run_thread: threading.Thread | None = None
 
-    # 로그 영역 (스크롤 텍스트)
-    log_frame = ttk.LabelFrame(root, text="로그", padding=6)
-    log_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
-    log_text = scrolledtext.ScrolledText(log_frame, height=12, state=tk.DISABLED, wrap=tk.WORD, font=("Consolas", 9))
+    top_frame = tk.Frame(root, bg="#f0f0f0", pady=12)
+    top_frame.pack(fill=tk.X, padx=12)
+    title_font = tkfont.Font(family="Malgun Gothic", size=18, weight="bold")
+    tk.Label(top_frame, text="네이버 블로그 자동 글쓰기 v1.0.0", fg=GREEN, bg="#f0f0f0", font=title_font).pack(anchor=tk.W)
+    desc = "안녕하세요. 네이버 블로그 자동 글쓰기 프로그램입니다. 로그인 정보와 OpenAI API 키를 입력한 뒤 자동화 시작을 클릭하면 GPT가 글을 생성하고 블로그에 저장 또는 발행합니다."
+    tk.Label(top_frame, text=desc, fg=GREEN, bg="#f0f0f0", font=("Malgun Gothic", 9), wraplength=860, justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 0))
+
+    btn_frame = tk.Frame(root, bg="#f0f0f0", pady=10)
+    btn_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=12)
+
+    paned = tk.PanedWindow(root, orient=tk.HORIZONTAL, bg="#f0f0f0", sashwidth=6)
+    paned.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
+    left_inner = tk.Frame(paned, bg="#f0f0f0")
+    paned.add(left_inner, width=420)
+
+    def section(parent: tk.Widget, title: str) -> tk.LabelFrame:
+        return tk.LabelFrame(parent, text=title, fg=GREEN, bg="#f0f0f0", font=("Malgun Gothic", 10, "bold"), padx=10, pady=8)
+
+    api_f = section(left_inner, "API 키 입력 (OpenAI)")
+    api_f.pack(fill=tk.X, pady=(0, 10))
+    tk.Label(api_f, text="OpenAI API 키:", bg="#f0f0f0", font=("Malgun Gothic", 9)).pack(anchor=tk.W)
+    tk.Entry(api_f, textvariable=var_api_key, show="*", width=45, font=("Malgun Gothic", 10)).pack(fill=tk.X, pady=(2, 6))
+    def open_api() -> None:
+        import webbrowser
+        webbrowser.open("https://platform.openai.com/api-keys")
+    tk.Button(api_f, text="API키 발급 링크", fg="white", bg=BLUE, font=("Malgun Gothic", 9), relief=tk.FLAT, padx=10, pady=4, cursor="hand2", command=open_api).pack(anchor=tk.W, pady=(0, 2))
+
+    login_f = section(left_inner, "네이버 로그인")
+    login_f.pack(fill=tk.X, pady=(0, 10))
+    tk.Label(login_f, text="아이디:", bg="#f0f0f0", font=("Malgun Gothic", 9)).pack(anchor=tk.W)
+    tk.Entry(login_f, textvariable=var_naver_id, width=45, font=("Malgun Gothic", 10)).pack(fill=tk.X, pady=(2, 6))
+    tk.Label(login_f, text="비밀번호:", bg="#f0f0f0", font=("Malgun Gothic", 9)).pack(anchor=tk.W)
+    tk.Entry(login_f, textvariable=var_naver_pw, show="*", width=45, font=("Malgun Gothic", 10)).pack(fill=tk.X, pady=(2, 6))
+
+    save_f = section(left_inner, "설정 저장")
+    save_f.pack(fill=tk.X, pady=(0, 10))
+    tk.Checkbutton(save_f, text="다음 실행 시 자동으로 로그인 정보 불러오기", variable=var_save_login, bg="#f0f0f0", font=("Malgun Gothic", 9), activebackground="#f0f0f0", selectcolor="white").pack(anchor=tk.W)
+    tk.Checkbutton(save_f, text="API 키도 함께 저장", variable=var_save_api, bg="#f0f0f0", font=("Malgun Gothic", 9), activebackground="#f0f0f0", selectcolor="white").pack(anchor=tk.W, pady=(2, 0))
+
+    write_f = section(left_inner, "글쓰기 설정")
+    write_f.pack(fill=tk.X, pady=(0, 10))
+    tk.Label(write_f, text="주제 (비우면 최신 이슈 자동 선택):", bg="#f0f0f0", font=("Malgun Gothic", 9)).pack(anchor=tk.W)
+    tk.Entry(write_f, textvariable=var_topic, width=45, font=("Malgun Gothic", 10)).pack(fill=tk.X, pady=(2, 6))
+    tk.Checkbutton(write_f, text="수동 로그인 (캡차/2단계 인증 시 사용)", variable=var_manual, bg="#f0f0f0", font=("Malgun Gothic", 9), activebackground="#f0f0f0", selectcolor="white").pack(anchor=tk.W, pady=(4, 2))
+    tk.Label(write_f, text="글 작성 후:", bg="#f0f0f0", font=("Malgun Gothic", 9)).pack(anchor=tk.W, pady=(6, 2))
+    act_inner = tk.Frame(write_f, bg="#f0f0f0")
+    act_inner.pack(anchor=tk.W)
+    tk.Radiobutton(act_inner, text="저장", variable=var_action, value="save", bg="#f0f0f0", font=("Malgun Gothic", 9)).pack(side=tk.LEFT, padx=(0, 16))
+    tk.Radiobutton(act_inner, text="발행", variable=var_action, value="publish", bg="#f0f0f0", font=("Malgun Gothic", 9)).pack(side=tk.LEFT)
+
+    right_frame = tk.Frame(paned, bg="#f0f0f0")
+    paned.add(right_frame, width=440)
+    tk.Label(right_frame, text="실행 로그", fg=GREEN, bg="#f0f0f0", font=("Malgun Gothic", 11, "bold")).pack(anchor=tk.W, padx=(8, 0), pady=(4, 4))
+    log_text = scrolledtext.ScrolledText(right_frame, height=24, state=tk.DISABLED, wrap=tk.WORD, font=("Consolas", 9), bg="white", relief=tk.FLAT, padx=8, pady=8)
     log_text.pack(fill=tk.BOTH, expand=True)
 
     def log_msg(msg: str) -> None:
-        def _():
+        def _() -> None:
             log_text.configure(state=tk.NORMAL)
             log_text.insert(tk.END, msg + "\n")
             log_text.see(tk.END)
             log_text.configure(state=tk.DISABLED)
         root.after(0, _)
 
-    # 설정 프레임
-    set_frame = ttk.LabelFrame(root, text="설정", padding=8)
-    set_frame.pack(fill=tk.X, padx=8, pady=4)
-
-    ttk.Label(set_frame, text="네이버 ID").grid(row=0, column=0, sticky=tk.W, pady=2)
-    ttk.Entry(set_frame, textvariable=var_naver_id, width=28).grid(row=0, column=1, sticky=tk.EW, padx=4, pady=2)
-    ttk.Label(set_frame, text="네이버 비밀번호").grid(row=1, column=0, sticky=tk.W, pady=2)
-    ttk.Entry(set_frame, textvariable=var_naver_pw, show="*", width=28).grid(row=1, column=1, sticky=tk.EW, padx=4, pady=2)
-    ttk.Label(set_frame, text="OpenAI API Key").grid(row=2, column=0, sticky=tk.W, pady=2)
-    ttk.Entry(set_frame, textvariable=var_api_key, show="*", width=28).grid(row=2, column=1, sticky=tk.EW, padx=4, pady=2)
-    ttk.Label(set_frame, text="주제 (비우면 자동)").grid(row=3, column=0, sticky=tk.W, pady=2)
-    ttk.Entry(set_frame, textvariable=var_topic, width=28).grid(row=3, column=1, sticky=tk.EW, padx=4, pady=2)
-
-    ttk.Checkbutton(set_frame, text="수동 로그인 (캡차/2단계 시)", variable=var_manual).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=4)
-    act_frame = ttk.Frame(set_frame)
-    act_frame.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=2)
-    ttk.Radiobutton(act_frame, text="저장", variable=var_action, value="save").pack(side=tk.LEFT, padx=(0, 12))
-    ttk.Radiobutton(act_frame, text="발행", variable=var_action, value="publish").pack(side=tk.LEFT)
-
-    set_frame.columnconfigure(1, weight=1)
-
-    # 버튼: 로그인 완료 (수동 로그인 시), 브라우저 닫기, 실행, 설정 저장
-    btn_frame = ttk.Frame(root)
-    btn_frame.pack(fill=tk.X, padx=8, pady=6)
-
-    btn_manual_ok = ttk.Button(btn_frame, text="로그인 완료", state=tk.DISABLED)
-    btn_manual_ok.pack(side=tk.LEFT, padx=(0, 8))
-
-    def do_manual_ok() -> None:
-        if manual_login_event:
-            manual_login_event.set()
-        btn_manual_ok.configure(state=tk.DISABLED)
-
-    btn_manual_ok.configure(command=do_manual_ok)
-
-    btn_close_browser = ttk.Button(btn_frame, text="브라우저 닫기", state=tk.DISABLED)
-
-    def do_close_browser() -> None:
-        nonlocal current_driver
-        if current_driver:
-            try:
-                current_driver.quit()
-            except Exception:
-                pass
-            current_driver = None
-        btn_close_browser.configure(state=tk.DISABLED)
-        log_msg("브라우저를 닫았습니다.")
-
-    btn_close_browser.configure(command=do_close_browser)
-    btn_close_browser.pack(side=tk.LEFT, padx=(0, 8))
-
-    def save_config_click() -> None:
-        save_gui_config({
-            "naver_id": var_naver_id.get().strip(),
-            "naver_pw": var_naver_pw.get(),
-            "api_key": var_api_key.get(),
-            "manual_login": var_manual.get(),
-            "blog_action": var_action.get(),
-            "topic": var_topic.get().strip(),
-        })
-        messagebox.showinfo("저장", "설정을 저장했습니다.")
-
-    ttk.Button(btn_frame, text="설정 저장", command=save_config_click).pack(side=tk.LEFT, padx=(0, 8))
-
     def run_click() -> None:
-        nonlocal current_driver, manual_login_event, run_thread
-
+        nonlocal current_driver, manual_login_event
         naver_id = var_naver_id.get().strip()
         naver_pw = var_naver_pw.get()
         api_key = var_api_key.get().strip()
         if not naver_id or not naver_pw or not api_key:
-            messagebox.showwarning("입력 오류", "네이버 ID, 비밀번호, OpenAI API Key를 모두 입력하세요.")
+            messagebox.showwarning("입력 오류", "네이버 아이디, 비밀번호, OpenAI API 키를 모두 입력하세요.")
             return
-
-        cfg = NaverConfig(
-            naver_id=naver_id,
-            naver_pw=naver_pw,
-            openai_api_key=api_key,
-            manual_login=var_manual.get(),
-            blog_action=var_action.get(),
-        )
+        data = {"naver_id": naver_id, "naver_pw": naver_pw, "manual_login": var_manual.get(), "blog_action": var_action.get(), "topic": var_topic.get().strip(), "save_login": var_save_login.get(), "save_api_key": var_save_api.get()}
+        if var_save_api.get():
+            data["api_key"] = api_key
+        else:
+            data["api_key"] = load_gui_config().get("api_key", "")
+        save_gui_config(data)
+        cfg = NaverConfig(naver_id=naver_id, naver_pw=naver_pw, openai_api_key=api_key, manual_login=var_manual.get(), blog_action=var_action.get())
         topic = var_topic.get().strip() or None
         manual_login_event = threading.Event()
         if cfg.manual_login:
@@ -584,28 +576,46 @@ def main_gui():
 
         def run() -> None:
             nonlocal current_driver
-            driver, err = run_blog_workflow(
-                cfg, topic, log_fn=log_msg, manual_login_event=manual_login_event
-            )
+            driver, err = run_blog_workflow(cfg, topic, log_fn=log_msg, manual_login_event=manual_login_event)
             def after_run() -> None:
                 nonlocal current_driver
                 if err:
                     messagebox.showerror("오류", err)
                     return
                 current_driver = driver
-                if driver:
-                    btn_close_browser.configure(state=tk.NORMAL)
             root.after(0, after_run)
-
-        run_thread = threading.Thread(target=run, daemon=True)
-        run_thread.start()
+        threading.Thread(target=run, daemon=True).start()
         log_msg("실행을 시작합니다...")
 
-    ttk.Button(btn_frame, text="실행", command=run_click).pack(side=tk.LEFT)
+    tk.Button(btn_frame, text="자동화 시작", fg="white", bg=BLUE, font=("Malgun Gothic", 10), relief=tk.FLAT, padx=14, pady=6, cursor="hand2", command=run_click).pack(side=tk.LEFT, padx=(0, 8))
+    def do_stop() -> None:
+        nonlocal current_driver
+        if current_driver:
+            try:
+                current_driver.quit()
+            except Exception:
+                pass
+            current_driver = None
+            log_msg("중지되었습니다. 브라우저를 닫았습니다.")
+    tk.Button(btn_frame, text="중지", fg="white", bg=RED, font=("Malgun Gothic", 10), relief=tk.FLAT, padx=14, pady=6, cursor="hand2", command=do_stop).pack(side=tk.LEFT, padx=(0, 8))
+    btn_manual_ok = tk.Button(btn_frame, text="로그인 완료", state=tk.DISABLED, fg="white", bg=GREEN, font=("Malgun Gothic", 10), relief=tk.FLAT, padx=14, pady=6, cursor="hand2")
+    def do_manual_ok() -> None:
+        if manual_login_event:
+            manual_login_event.set()
+        btn_manual_ok.configure(state=tk.DISABLED)
+    btn_manual_ok.configure(command=do_manual_ok)
+    btn_manual_ok.pack(side=tk.LEFT)
 
+    def load_saved_if_needed() -> None:
+        c = load_gui_config()
+        if c.get("save_login", True):
+            var_naver_id.set(c.get("naver_id", ""))
+            var_naver_pw.set(c.get("naver_pw", ""))
+        if c.get("save_api_key", False):
+            var_api_key.set(c.get("api_key", ""))
+    load_saved_if_needed()
     root.mainloop()
 
 
 if __name__ == "__main__":
     main_gui()
-

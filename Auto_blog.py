@@ -1055,6 +1055,7 @@ def run_blog_workflow(
     manual_login_event: threading.Event | None = None,
     hot_system: str | None = None,
     hot_user_suffix: str | None = None,
+    profile: str | None = None,
 ) -> tuple[webdriver.Chrome | None, str | None]:
     """블로그 글 생성 ~ 저장/발행. 반환: (None, None) 성공(브라우저는 이미 종료), (None, error_msg) 실패."""
     def log(msg: str) -> None:
@@ -1064,7 +1065,7 @@ def run_blog_workflow(
             print(msg)
 
     try:
-        gc = load_gui_config()
+        gc = load_gui_config(profile)
         if hot_system is None and hot_user_suffix is None:
             sys_ov = (gc.get("prompt_hot_system") or "").strip() or None
             suf_ov = (gc.get("prompt_hot_user_suffix") or "").strip() or None
@@ -1150,12 +1151,131 @@ def run_blog_workflow(
         return (None, _sanitize_error_for_gui(str(e)))
 
 
-def _gui_config_path() -> Path:
-    return Path(__file__).resolve().parent / "gui_config.json"
+_PROFILES_META_FILENAME = "gui_profiles.json"
+_DEFAULT_PROFILE = "default"
 
 
-def load_gui_config() -> dict:
-    path = _gui_config_path()
+def _config_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _sanitize_profile_id(name: str) -> str:
+    """프로필 이름을 파일명에 쓸 수 있게 정리."""
+    s = (name or "").strip()
+    if not s:
+        return _DEFAULT_PROFILE
+    for c in r'/\:*?"<>|':
+        s = s.replace(c, "_")
+    return s or _DEFAULT_PROFILE
+
+
+def _gui_config_path(profile: str | None = None) -> Path:
+    """프로필별 설정 파일 경로. profile=None이면 기본(legacy) 경로."""
+    base = _config_dir()
+    if profile is None or profile == _DEFAULT_PROFILE:
+        return base / "gui_config.json"
+    return base / f"gui_config_{_sanitize_profile_id(profile)}.json"
+
+
+def _profiles_meta_path() -> Path:
+    return _config_dir() / _PROFILES_META_FILENAME
+
+
+def _ensure_profiles_meta() -> dict:
+    """프로필 메타 초기화. 기존 gui_config.json이 있으면 default로 등록."""
+    meta_path = _profiles_meta_path()
+    legacy_path = _config_dir() / "gui_config.json"
+    if meta_path.exists():
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    profiles = [_DEFAULT_PROFILE]
+    if legacy_path.exists():
+        profiles = [_DEFAULT_PROFILE]
+    meta = {"current": _DEFAULT_PROFILE, "profiles": profiles}
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return meta
+
+
+def load_profiles_meta() -> dict:
+    meta = _ensure_profiles_meta()
+    if "profiles" not in meta or not meta["profiles"]:
+        meta["profiles"] = [_DEFAULT_PROFILE]
+    if meta.get("current") not in meta["profiles"]:
+        meta["current"] = meta["profiles"][0]
+    return meta
+
+
+def save_profiles_meta(meta: dict) -> None:
+    with open(_profiles_meta_path(), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+
+def add_profile(name: str) -> str:
+    """새 프로필 추가. 반환: 실제 사용할 프로필 ID."""
+    name = (name or "").strip()
+    if not name:
+        return _DEFAULT_PROFILE
+    pid = _sanitize_profile_id(name)
+    if pid == _DEFAULT_PROFILE:
+        return _DEFAULT_PROFILE
+    meta = load_profiles_meta()
+    if pid not in meta["profiles"]:
+        meta["profiles"].append(pid)
+        save_profiles_meta(meta)
+        path = _gui_config_path(pid)
+        if not path.exists():
+            default_data = {}
+            try:
+                legacy = _config_dir() / "gui_config.json"
+                if legacy.exists():
+                    with open(legacy, "r", encoding="utf-8") as f:
+                        default_data = json.load(f)
+            except Exception:
+                pass
+            default_data["naver_id"] = ""
+            default_data["naver_pw"] = ""
+            default_data["topic"] = ""
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(default_data, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+    return pid
+
+
+def delete_profile(profile_id: str) -> bool:
+    """프로필 삭제. default는 삭제 불가."""
+    if not profile_id or profile_id == _DEFAULT_PROFILE:
+        return False
+    meta = load_profiles_meta()
+    if profile_id not in meta["profiles"]:
+        return False
+    meta["profiles"] = [p for p in meta["profiles"] if p != profile_id]
+    if meta["current"] == profile_id:
+        meta["current"] = meta["profiles"][0] if meta["profiles"] else _DEFAULT_PROFILE
+    save_profiles_meta(meta)
+    path = _gui_config_path(profile_id)
+    if path.exists():
+        try:
+            path.unlink()
+        except Exception:
+            pass
+    return True
+
+
+def load_gui_config(profile: str | None = None) -> dict:
+    """프로필별 설정 로드. profile=None이면 현재 프로필(메타 기준)."""
+    if profile is None:
+        meta = load_profiles_meta()
+        profile = meta.get("current") or _DEFAULT_PROFILE
+    path = _gui_config_path(profile)
     if path.exists():
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -1165,8 +1285,13 @@ def load_gui_config() -> dict:
     return {}
 
 
-def save_gui_config(data: dict) -> None:
-    with open(_gui_config_path(), "w", encoding="utf-8") as f:
+def save_gui_config(data: dict, profile: str | None = None) -> None:
+    """프로필별 설정 저장. profile=None이면 현재 프로필."""
+    if profile is None:
+        meta = load_profiles_meta()
+        profile = meta.get("current") or _DEFAULT_PROFILE
+    path = _gui_config_path(profile)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
@@ -1174,29 +1299,34 @@ def main_gui() -> None:
     import sys
     import time
     import tkinter as tk
-    from tkinter import scrolledtext, messagebox
+    from tkinter import scrolledtext, messagebox, simpledialog
 
     APP_VER = "v1.0.1"
-    BG_MAIN = "#E8EDF4"
-    BG_CARD = "#FFFFFF"
-    BG_HEADER = "#0F172A"
-    BG_FOOTER = "#0F172A"
-    TEXT_MAIN = "#0F172A"
-    TEXT_MUTED = "#64748B"
-    BORDER = "#CBD5E1"
-    ACCENT = "#2563EB"
-    ACCENT_DARK = "#1D4ED8"
-    GREEN_BTN = "#059669"
-    GREEN_DARK = "#047857"
-    ORANGE_BTN = "#EA580C"
-    RED_BTN = "#DC2626"
-    SLATE_BTN = "#475569"
+    # === 상용툴급 프리미엄 테마 (Indigo + Emerald) ===
+    BG_MAIN = "#F1F5F9"           # 차분한 라이트 그레이
+    BG_CARD = "#FFFFFF"           # 순백 카드
+    BG_HEADER = "#1E1B4B"        # 딥 인디고 헤더 (프리미엄)
+    BG_FOOTER = "#1E1B4B"        # 딥 인디고 푸터
+    TEXT_MAIN = "#0F172A"        # 진한 텍스트 (가독성↑)
+    TEXT_MUTED = "#64748B"       # 보조 텍스트
+    BORDER = "#E2E8F0"
+    BORDER_ACCENT = "#A5B4FC"    # 인디고 톤 보더
+    ACCENT = "#6366F1"           # 인디고 500 (가시성·프리미엄)
+    ACCENT_DARK = "#4F46E5"      # 인디고 600 (호버)
+    GREEN_BTN = "#10B981"        # 에메랄드 (성공/시작)
+    GREEN_DARK = "#059669"
+    ORANGE_BTN = "#F59E0B"       # 앰버 (경고/중지)
+    RED_BTN = "#EF4444"          # 레드 (위험/중지)
+    SLATE_BTN = "#475569"        # 슬레이트 (보조 버튼)
+    INPUT_BG = "#F8FAFC"         # 입력 필드 배경
+    LOG_BG = "#0F172A"           # 로그 다크 배경
+    LOG_FG = "#E2E8F0"           # 로그 밝은 텍스트
 
     root = tk.Tk()
     root.title(f"네이버 블로그 자동 글쓰기 {APP_VER}")
     root.withdraw()
-    root.geometry("1320x880")
-    root.minsize(1080, 700)
+    root.geometry("1360x900")
+    root.minsize(1100, 720)
     root.configure(bg=BG_MAIN)
 
     _icon_path = Path(__file__).resolve().parent / "assets" / "app_icon.ico"
@@ -1206,56 +1336,52 @@ def main_gui() -> None:
         except Exception:
             pass
 
+    # ttkbootstrap 제거 — 커스텀 테마 적용을 위해 기본 ttk 사용
     spinbox_boot = None
     try:
-        import ttkbootstrap as ttkb
-
-        ttkb.Style(theme="litera", master=root)
-        spinbox_boot = ttkb.Spinbox
-    except Exception:
         from tkinter import ttk as _ttk
 
         _st = _ttk.Style()
         try:
-            _st.theme_use("vista" if sys.platform == "win32" else "clam")
+            _st.theme_use("clam")
         except Exception:
-            try:
-                _st.theme_use("clam")
-            except Exception:
-                pass
+            pass
+    except Exception:
+        pass
+    root.configure(bg=BG_MAIN)  # ttk 이후에도 배경색 유지
 
     splash_closed = False
     splash_start = time.perf_counter()
     splash = tk.Toplevel(root)
     splash.overrideredirect(True)
-    splash.configure(bg="#0F172A")
+    splash.configure(bg=BG_HEADER)
     try:
         splash.attributes("-topmost", True)
     except Exception:
         pass
     _sw, _sh = splash.winfo_screenwidth(), splash.winfo_screenheight()
-    _sw_w, _sw_h = 480, 320
+    _sw_w, _sw_h = 520, 360
     splash.geometry(f"{_sw_w}x{_sw_h}+{(_sw - _sw_w) // 2}+{(_sh - _sw_h) // 2}")
-    _sp = tk.Frame(splash, bg="#0F172A")
+    _sp = tk.Frame(splash, bg=BG_HEADER)
     _sp.pack(expand=True, fill=tk.BOTH)
-    tk.Frame(_sp, height=5, bg=ACCENT).pack(fill=tk.X)
-    tk.Label(_sp, text="◆", font=("Malgun Gothic", 32), fg=ACCENT, bg="#0F172A").pack(pady=(32, 6))
+    tk.Frame(_sp, height=4, bg=ACCENT).pack(fill=tk.X)
+    tk.Label(_sp, text="◆", font=("Malgun Gothic", 36), fg="#A5B4FC", bg=BG_HEADER).pack(pady=(40, 8))
     tk.Label(
         _sp,
         text="네이버 블로그 자동 글쓰기",
-        font=("Malgun Gothic", 20, "bold"),
+        font=("Malgun Gothic", 22, "bold"),
         fg="#F8FAFC",
-        bg="#0F172A",
+        bg=BG_HEADER,
     ).pack()
-    tk.Label(_sp, text=APP_VER, font=("Malgun Gothic", 11), fg="#94A3B8", bg="#0F172A").pack(pady=(12, 4))
-    tk.Label(_sp, text="GPT 생성 · 예약 업로드 · RSS 자동 감시", font=("Malgun Gothic", 10), fg="#64748B", bg="#0F172A").pack()
+    tk.Label(_sp, text=APP_VER, font=("Malgun Gothic", 11), fg="#A5B4FC", bg=BG_HEADER).pack(pady=(8, 2))
+    tk.Label(_sp, text="GPT 생성 · 예약 업로드 · RSS 자동 감시", font=("Malgun Gothic", 11), fg="#A5B4FC", bg=BG_HEADER).pack()
     tk.Label(
         _sp,
         text="준비 중…  ·  클릭 또는 Esc 로 바로 시작",
-        font=("Malgun Gothic", 9),
-        fg="#475569",
-        bg="#0F172A",
-    ).pack(pady=(36, 44))
+        font=("Malgun Gothic", 10),
+        fg="#64748B",
+        bg=BG_HEADER,
+    ).pack(pady=(40, 50))
     splash.update_idletasks()
 
     def _close_splash() -> None:
@@ -1283,13 +1409,15 @@ def main_gui() -> None:
     splash.bind("<Escape>", lambda _e: _close_splash())
     splash.focus_set()
 
+    _meta = load_profiles_meta()
+    var_current_profile = tk.StringVar(value=_meta.get("current") or _DEFAULT_PROFILE)
     var_naver_id = tk.StringVar()
     var_naver_pw = tk.StringVar()
     var_api_key = tk.StringVar()
     var_manual = tk.BooleanVar(value=False)
     var_action = tk.StringVar(value="save")
     var_topic = tk.StringVar()
-    cfg = load_gui_config()
+    cfg = load_gui_config(var_current_profile.get())
     _ts = (cfg.get("topic_source") or "google_trends").strip().lower()
     if _ts not in ("manual", "google_trends", "news_rss", "trend_1", "news_1"):
         _ts = "google_trends"
@@ -1344,37 +1472,39 @@ def main_gui() -> None:
     current_driver: webdriver.Chrome | None = None
     manual_login_event: threading.Event | None = None
 
-    top_frame = tk.Frame(root, bg=BG_HEADER, pady=16, padx=20)
+    top_frame = tk.Frame(root, bg=BG_HEADER, pady=18, padx=24)
     top_frame.pack(fill=tk.X)
+    tk.Frame(top_frame, height=3, bg=ACCENT).pack(fill=tk.X, pady=(0, 14))
     tk.Label(
         top_frame,
         text=f"네이버 블로그 자동 글쓰기  {APP_VER}",
         fg="#F8FAFC",
         bg=BG_HEADER,
-        font=("Malgun Gothic", 20, "bold"),
+        font=("Malgun Gothic", 22, "bold"),
     ).pack(anchor=tk.W)
     tk.Label(
         top_frame,
         text="GPT로 글을 쓰고 네이버 블로그에 저장·발행 · 예약 업로드 · RSS 자동 감시",
-        fg="#94A3B8",
+        fg="#A5B4FC",
         bg=BG_HEADER,
-        font=("Malgun Gothic", 10),
-    ).pack(anchor=tk.W, pady=(6, 0))
+        font=("Malgun Gothic", 11),
+    ).pack(anchor=tk.W, pady=(8, 0))
 
-    btn_frame = tk.Frame(root, bg=BG_FOOTER, pady=14, padx=16)
+    btn_frame = tk.Frame(root, bg=BG_FOOTER, pady=18, padx=24)
     btn_frame.pack(side=tk.BOTTOM, fill=tk.X)
+    tk.Frame(btn_frame, height=1, bg="#4338CA").pack(fill=tk.X, side=tk.TOP)
 
-    paned = tk.PanedWindow(root, orient=tk.HORIZONTAL, bg=BG_MAIN, sashwidth=8, sashrelief=tk.FLAT)
-    paned.pack(fill=tk.BOTH, expand=True, padx=12, pady=(10, 0))
+    paned = tk.PanedWindow(root, orient=tk.HORIZONTAL, bg=BG_MAIN, sashwidth=10, sashrelief=tk.FLAT)
+    paned.pack(fill=tk.BOTH, expand=True, padx=16, pady=(14, 0))
     left_inner = tk.Frame(paned, bg=BG_MAIN)
     paned.add(left_inner, minsize=280, width=340)
 
     left_vp = tk.PanedWindow(left_inner, orient=tk.VERTICAL, bg=BG_MAIN, sashwidth=6)
     left_vp.pack(fill=tk.BOTH, expand=True)
     left_top = tk.Frame(left_vp, bg=BG_MAIN)
-    left_vp.add(left_top, minsize=260)
+    left_vp.add(left_top, minsize=400)
     left_bot = tk.Frame(left_vp, bg=BG_MAIN)
-    left_vp.add(left_bot, minsize=320)
+    left_vp.add(left_bot, minsize=300)
 
     def section(parent: tk.Widget, title: str) -> tk.LabelFrame:
         return tk.LabelFrame(
@@ -1383,40 +1513,163 @@ def main_gui() -> None:
             fg=ACCENT,
             bg=BG_CARD,
             font=("Malgun Gothic", 10, "bold"),
-            padx=12,
-            pady=10,
+            padx=16,
+            pady=14,
             relief=tk.FLAT,
-            highlightthickness=1,
+            highlightthickness=2,
             highlightbackground=BORDER,
+            highlightcolor=BORDER_ACCENT,
         )
 
-    chk_kw = dict(bg=BG_CARD, font=("Malgun Gothic", 9), activebackground=BG_CARD, selectcolor="#E0F2FE", fg=TEXT_MAIN, activeforeground=TEXT_MAIN)
+    _entry_kw = dict(font=("Malgun Gothic", 10), relief=tk.FLAT, highlightthickness=2, highlightbackground=BORDER, highlightcolor=ACCENT, bg=INPUT_BG, insertbackground=TEXT_MAIN)
+    chk_kw = dict(bg=BG_CARD, font=("Malgun Gothic", 9), activebackground=BG_CARD, selectcolor="#C7D2FE", fg=TEXT_MAIN, activeforeground=TEXT_MAIN)
+
+    def _get_profile() -> str:
+        return var_current_profile.get() or _DEFAULT_PROFILE
+
+    def _apply_profile_to_form(profile: str) -> None:
+        c = load_gui_config(profile)
+        var_naver_id.set(c.get("naver_id", ""))
+        var_naver_pw.set(c.get("naver_pw", ""))
+        var_api_key.set(c.get("api_key", ""))
+        var_manual.set(c.get("manual_login", False))
+        var_action.set("publish" if c.get("blog_action") == "publish" else "save")
+        var_topic.set(c.get("topic", ""))
+        _ts = (c.get("topic_source") or "google_trends").strip().lower()
+        if _ts not in ("manual", "google_trends", "news_rss", "trend_1", "news_1"):
+            _ts = "google_trends"
+        var_topic_source.set(_ts)
+        _tf = c.get("trend_field") or "전체"
+        var_trend_field.set(_tf if _tf in TREND_FIELD_OPTIONS else "전체")
+        var_save_login.set(c.get("save_login", True))
+        var_save_api.set(c.get("save_api_key", False))
+        _today = datetime.now().date().isoformat()
+        _end_default = (datetime.now().date() + timedelta(days=30)).isoformat()
+        var_start_date.set(c.get("schedule_start") or _today)
+        var_end_date.set(c.get("schedule_end") or _end_default)
+        var_time_start.set(c.get("schedule_time_start", "09:00"))
+        var_time_end.set(c.get("schedule_time_end", "21:00"))
+        var_runs_per_day.set(str(c.get("schedule_runs_per_day", 2)))
+        var_rss_check_interval.set(str(c.get("rss_interval_hours", 3)))
+        var_rss_auto_enabled.set(c.get("rss_auto_enabled", False))
+        var_rss_include_source_link.set(c.get("rss_include_source_link", False))
+        var_rss_image_memo_only.set(c.get("rss_image_memo_only", True))
+        var_rss_publish_mode.set(c.get("rss_publish_mode", "save"))
+        rss_urls = c.get("rss_urls", [])
+        rss_urls_listbox.delete(0, tk.END)
+        for u in rss_urls:
+            if isinstance(u, str) and u.strip():
+                rss_urls_listbox.insert(tk.END, u)
+        try:
+            _load_prompt_widgets_from_config()
+        except Exception:
+            pass
+
+    def _save_form_to_profile(profile: str) -> None:
+        data = load_gui_config(profile)
+        data["naver_id"] = var_naver_id.get().strip()
+        data["naver_pw"] = var_naver_pw.get()
+        data["manual_login"] = var_manual.get()
+        data["blog_action"] = var_action.get()
+        data["topic"] = var_topic.get().strip()
+        data["topic_source"] = var_topic_source.get()
+        data["trend_field"] = var_trend_field.get()
+        data["save_login"] = var_save_login.get()
+        data["save_api_key"] = var_save_api.get()
+        data["api_key"] = var_api_key.get().strip() if var_save_api.get() else data.get("api_key", "")
+        data["rss_urls"] = [rss_urls_listbox.get(i) for i in range(rss_urls_listbox.size())]
+        data["rss_interval_hours"] = int(var_rss_check_interval.get().strip() or "3")
+        data["rss_auto_enabled"] = bool(var_rss_auto_enabled.get())
+        data["rss_include_source_link"] = bool(var_rss_include_source_link.get())
+        data["rss_image_memo_only"] = bool(var_rss_image_memo_only.get())
+        data["rss_publish_mode"] = var_rss_publish_mode.get()
+        data["prompt_hot_system"] = txt_prompt_hot_system.get("1.0", tk.END).rstrip("\n")
+        data["prompt_hot_user_suffix"] = txt_prompt_hot_user.get("1.0", tk.END).rstrip("\n")
+        data["prompt_rss_system"] = txt_prompt_rss_system.get("1.0", tk.END).rstrip("\n")
+        data["prompt_rss_user"] = txt_prompt_rss_user.get("1.0", tk.END).rstrip("\n")
+        save_gui_config(data, profile)
+
+    def _refresh_profile_combo() -> None:
+        meta = load_profiles_meta()
+        profile_combo["values"] = meta.get("profiles", [_DEFAULT_PROFILE])
+        var_current_profile.set(meta.get("current") or _DEFAULT_PROFILE)
+
+    def _on_profile_change(*args: object) -> None:
+        new_prof = var_current_profile.get()
+        if not new_prof:
+            return
+        meta = load_profiles_meta()
+        if new_prof not in meta.get("profiles", []):
+            return
+        old_prof = meta.get("current") or _DEFAULT_PROFILE
+        if old_prof == new_prof:
+            return
+        _save_form_to_profile(old_prof)
+        meta["current"] = new_prof
+        save_profiles_meta(meta)
+        _apply_profile_to_form(new_prof)
+
+    def _on_add_profile() -> None:
+        name = simpledialog.askstring("프로필 추가", "프로필 이름 (예: 계정2, 계정3):", parent=root)
+        if not name or not name.strip():
+            return
+        _save_form_to_profile(_get_profile())
+        pid = add_profile(name.strip())
+        _refresh_profile_combo()
+        var_current_profile.set(pid)
+        meta = load_profiles_meta()
+        meta["current"] = pid
+        save_profiles_meta(meta)
+        _apply_profile_to_form(pid)
+        log_msg(f"프로필 '{pid}' 추가됨.")
+
+    def _on_delete_profile() -> None:
+        prof = _get_profile()
+        if prof == _DEFAULT_PROFILE:
+            messagebox.showinfo("프로필", "기본 프로필은 삭제할 수 없습니다.")
+            return
+        if not messagebox.askyesno("프로필 삭제", f"프로필 '{prof}'를 삭제하시겠습니까?"):
+            return
+        _save_form_to_profile(prof)
+        delete_profile(prof)
+        _refresh_profile_combo()
+        _apply_profile_to_form(_get_profile())
+        log_msg(f"프로필 '{prof}' 삭제됨.")
+
+    var_current_profile.trace_add("write", _on_profile_change)
 
     api_f = section(left_top, "OpenAI API")
-    api_f.pack(fill=tk.X, pady=(0, 8))
+    api_f.pack(fill=tk.X, pady=(0, 10))
     tk.Label(api_f, text="API 키", bg=BG_CARD, fg=TEXT_MUTED, font=("Malgun Gothic", 9)).pack(anchor=tk.W)
-    tk.Entry(api_f, textvariable=var_api_key, show="*", font=("Malgun Gothic", 10), relief=tk.FLAT, highlightthickness=1, highlightbackground=BORDER).pack(fill=tk.X, pady=(4, 8), ipady=6)
+    tk.Entry(api_f, textvariable=var_api_key, show="*", **_entry_kw).pack(fill=tk.X, pady=(4, 8), ipady=8)
 
     def open_api() -> None:
         import webbrowser
         webbrowser.open("https://platform.openai.com/api-keys")
 
-    tk.Button(api_f, text="키 발급 페이지 열기", fg="white", bg=ACCENT, activebackground=ACCENT_DARK, font=("Malgun Gothic", 9), relief=tk.FLAT, padx=12, pady=6, cursor="hand2", command=open_api).pack(anchor=tk.W)
+    tk.Button(api_f, text="키 발급 페이지 열기", fg="white", bg=ACCENT, activebackground=ACCENT_DARK, activeforeground="white", font=("Malgun Gothic", 9, "bold"), relief=tk.FLAT, padx=14, pady=8, cursor="hand2", command=open_api).pack(anchor=tk.W)
 
     login_f = section(left_top, "네이버 로그인")
-    login_f.pack(fill=tk.X, pady=(0, 8))
+    login_f.pack(fill=tk.X, pady=(0, 10))
+    prof_row = tk.Frame(login_f, bg=BG_CARD)
+    prof_row.pack(fill=tk.X, pady=(0, 6))
+    tk.Label(prof_row, text="계정", bg=BG_CARD, fg=TEXT_MUTED, font=("Malgun Gothic", 9)).pack(side=tk.LEFT, padx=(0, 6))
+    profile_combo = tk.ttk.Combobox(prof_row, textvariable=var_current_profile, values=_meta.get("profiles", [_DEFAULT_PROFILE]), state="readonly", width=10, font=("Malgun Gothic", 9))
+    profile_combo.pack(side=tk.LEFT, padx=(0, 4))
+    tk.Button(prof_row, text="+", fg="white", bg=ACCENT, activebackground=ACCENT_DARK, font=("Malgun Gothic", 8), relief=tk.FLAT, padx=6, pady=2, cursor="hand2", command=_on_add_profile).pack(side=tk.LEFT, padx=(0, 2))
+    tk.Button(prof_row, text="−", fg="white", bg=SLATE_BTN, activebackground="#334155", font=("Malgun Gothic", 8), relief=tk.FLAT, padx=6, pady=2, cursor="hand2", command=_on_delete_profile).pack(side=tk.LEFT)
     tk.Label(login_f, text="아이디", bg=BG_CARD, fg=TEXT_MUTED, font=("Malgun Gothic", 9)).pack(anchor=tk.W)
-    tk.Entry(login_f, textvariable=var_naver_id, font=("Malgun Gothic", 10), relief=tk.FLAT, highlightthickness=1, highlightbackground=BORDER).pack(fill=tk.X, pady=(4, 8), ipady=6)
+    tk.Entry(login_f, textvariable=var_naver_id, **_entry_kw).pack(fill=tk.X, pady=(4, 8), ipady=8)
     tk.Label(login_f, text="비밀번호", bg=BG_CARD, fg=TEXT_MUTED, font=("Malgun Gothic", 9)).pack(anchor=tk.W)
-    tk.Entry(login_f, textvariable=var_naver_pw, show="*", font=("Malgun Gothic", 10), relief=tk.FLAT, highlightthickness=1, highlightbackground=BORDER).pack(fill=tk.X, pady=(4, 0), ipady=6)
+    tk.Entry(login_f, textvariable=var_naver_pw, show="*", **_entry_kw).pack(fill=tk.X, pady=(4, 8), ipady=8)
 
     save_f = section(left_top, "설정 저장")
-    save_f.pack(fill=tk.X, pady=(0, 8))
+    save_f.pack(fill=tk.X, pady=(0, 10))
     tk.Checkbutton(save_f, text="다음 실행 시 로그인 정보 자동 불러오기", variable=var_save_login, **chk_kw).pack(anchor=tk.W)
     tk.Checkbutton(save_f, text="API 키도 파일에 저장", variable=var_save_api, **chk_kw).pack(anchor=tk.W, pady=(4, 0))
 
     write_f = section(left_top, "글쓰기 · 주제")
-    write_f.pack(fill=tk.X, pady=(0, 8))
+    write_f.pack(fill=tk.X, pady=(0, 10))
     tk.Label(
         write_f,
         text="주제 정하는 방식",
@@ -1456,7 +1709,7 @@ def main_gui() -> None:
     _om_tf.config(font=("Malgun Gothic", 9), bg=BG_CARD, highlightthickness=0)
     _om_tf.pack(anchor=tk.W, pady=(0, 6))
     tk.Label(write_f, text="직접 주제 (위에서 '직접 입력' 선택 시 필수)", bg=BG_CARD, fg=TEXT_MUTED, font=("Malgun Gothic", 9)).pack(anchor=tk.W)
-    tk.Entry(write_f, textvariable=var_topic, font=("Malgun Gothic", 10), relief=tk.FLAT, highlightthickness=1, highlightbackground=BORDER).pack(fill=tk.X, pady=(4, 8), ipady=6)
+    tk.Entry(write_f, textvariable=var_topic, **_entry_kw).pack(fill=tk.X, pady=(4, 8), ipady=8)
     tk.Checkbutton(write_f, text="수동 로그인 (캡차·2단계 인증 시) — 브라우저에서 직접 로그인 후 하단 초록 버튼", variable=var_manual, **chk_kw).pack(anchor=tk.W, pady=(0, 8))
     tk.Label(write_f, text="작성 후", bg=BG_CARD, fg=TEXT_MUTED, font=("Malgun Gothic", 9)).pack(anchor=tk.W)
     act_inner = tk.Frame(write_f, bg=BG_CARD)
@@ -1478,15 +1731,15 @@ def main_gui() -> None:
     tk.Label(sched_f, text="기간 (YYYY-MM-DD)", bg=BG_CARD, fg=TEXT_MAIN, font=("Malgun Gothic", 9, "bold")).pack(anchor=tk.W)
     sched_date_f = tk.Frame(sched_f, bg=BG_CARD)
     sched_date_f.pack(fill=tk.X, pady=(6, 12))
-    tk.Entry(sched_date_f, textvariable=var_start_date, width=11, font=("Malgun Gothic", 10), relief=tk.FLAT, highlightthickness=1, highlightbackground=BORDER).pack(side=tk.LEFT, padx=(0, 6), ipady=6)
+    tk.Entry(sched_date_f, textvariable=var_start_date, width=11, **_entry_kw).pack(side=tk.LEFT, padx=(0, 6), ipady=6)
     tk.Label(sched_date_f, text="~", bg=BG_CARD, fg=TEXT_MUTED).pack(side=tk.LEFT, padx=4)
-    tk.Entry(sched_date_f, textvariable=var_end_date, width=11, font=("Malgun Gothic", 10), relief=tk.FLAT, highlightthickness=1, highlightbackground=BORDER).pack(side=tk.LEFT, ipady=6)
+    tk.Entry(sched_date_f, textvariable=var_end_date, width=11, **_entry_kw).pack(side=tk.LEFT, ipady=6)
     tk.Label(sched_f, text="업로드 시간대 (HH:MM)", bg=BG_CARD, fg=TEXT_MAIN, font=("Malgun Gothic", 9, "bold")).pack(anchor=tk.W)
     sched_time_f = tk.Frame(sched_f, bg=BG_CARD)
     sched_time_f.pack(fill=tk.X, pady=(6, 12))
-    tk.Entry(sched_time_f, textvariable=var_time_start, width=7, font=("Malgun Gothic", 10), relief=tk.FLAT, highlightthickness=1, highlightbackground=BORDER).pack(side=tk.LEFT, padx=(0, 6), ipady=6)
+    tk.Entry(sched_time_f, textvariable=var_time_start, width=7, **_entry_kw).pack(side=tk.LEFT, padx=(0, 6), ipady=6)
     tk.Label(sched_time_f, text="~", bg=BG_CARD, fg=TEXT_MUTED).pack(side=tk.LEFT, padx=4)
-    tk.Entry(sched_time_f, textvariable=var_time_end, width=7, font=("Malgun Gothic", 10), relief=tk.FLAT, highlightthickness=1, highlightbackground=BORDER).pack(side=tk.LEFT, ipady=6)
+    tk.Entry(sched_time_f, textvariable=var_time_end, width=7, **_entry_kw).pack(side=tk.LEFT, ipady=6)
     tk.Label(sched_f, text="하루 업로드 횟수", bg=BG_CARD, fg=TEXT_MAIN, font=("Malgun Gothic", 9, "bold")).pack(anchor=tk.W)
     if spinbox_boot:
         spinbox_boot(sched_f, textvariable=var_runs_per_day, from_=1, to=10, width=5, bootstyle="primary").pack(anchor=tk.W, pady=(8, 0))
@@ -1497,10 +1750,12 @@ def main_gui() -> None:
             from_=1,
             to=10,
             width=6,
-            font=("Malgun Gothic", 11),
+            font=("Malgun Gothic", 10),
             relief=tk.FLAT,
-            highlightthickness=1,
+            highlightthickness=2,
             highlightbackground=BORDER,
+            highlightcolor=ACCENT,
+            bg=INPUT_BG,
         ).pack(anchor=tk.W, pady=(8, 0), ipady=4)
 
     # ——— 가운데: 위=프롬프트 · 아래=실행 로그 ———
@@ -1511,17 +1766,17 @@ def main_gui() -> None:
 
     hot_prompt_outer = tk.Frame(center_paned, bg=BG_MAIN)
     center_paned.add(hot_prompt_outer, minsize=300)
-    prompt_card = tk.Frame(hot_prompt_outer, bg=BG_CARD, highlightthickness=1, highlightbackground=BORDER)
+    prompt_card = tk.Frame(hot_prompt_outer, bg=BG_CARD, highlightthickness=2, highlightbackground=BORDER)
     prompt_card.pack(fill=tk.BOTH, expand=True)
     tk.Label(
         prompt_card,
         text="핫이슈 · 주제 글 프롬프트",
         fg=TEXT_MAIN,
         bg=BG_CARD,
-        font=("Malgun Gothic", 11, "bold"),
-    ).pack(anchor=tk.W, padx=12, pady=(12, 4))
+        font=("Malgun Gothic", 12, "bold"),
+    ).pack(anchor=tk.W, padx=14, pady=(14, 6))
     tk.Label(prompt_card, text="시스템 역할", bg=BG_CARD, fg=TEXT_MUTED, font=("Malgun Gothic", 9)).pack(anchor=tk.W, padx=12)
-    txt_prompt_hot_system = scrolledtext.ScrolledText(prompt_card, height=5, wrap=tk.WORD, font=("Malgun Gothic", 9), bg="#F8FAFC", relief=tk.FLAT, padx=8, pady=8)
+    txt_prompt_hot_system = scrolledtext.ScrolledText(prompt_card, height=5, wrap=tk.WORD, font=("Malgun Gothic", 9), bg=INPUT_BG, relief=tk.FLAT, padx=10, pady=10)
     txt_prompt_hot_system.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 8))
     tk.Label(
         prompt_card,
@@ -1532,7 +1787,7 @@ def main_gui() -> None:
         wraplength=520,
         justify=tk.LEFT,
     ).pack(anchor=tk.W, padx=12)
-    txt_prompt_hot_user = scrolledtext.ScrolledText(prompt_card, height=5, wrap=tk.WORD, font=("Malgun Gothic", 9), bg="#F8FAFC", relief=tk.FLAT, padx=8, pady=8)
+    txt_prompt_hot_user = scrolledtext.ScrolledText(prompt_card, height=5, wrap=tk.WORD, font=("Malgun Gothic", 9), bg=INPUT_BG, relief=tk.FLAT, padx=10, pady=10)
     txt_prompt_hot_user.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 8))
 
     prompt_btn_f = tk.Frame(prompt_card, bg=BG_CARD)
@@ -1540,17 +1795,17 @@ def main_gui() -> None:
 
     log_outer = tk.Frame(center_paned, bg=BG_MAIN)
     center_paned.add(log_outer, minsize=140)
-    log_card = tk.Frame(log_outer, bg=BG_CARD, highlightthickness=1, highlightbackground=BORDER)
+    log_card = tk.Frame(log_outer, bg=BG_CARD, highlightthickness=2, highlightbackground=BORDER)
     log_card.pack(fill=tk.BOTH, expand=True)
-    tk.Label(log_card, text="실행 로그", fg=TEXT_MAIN, bg=BG_CARD, font=("Malgun Gothic", 11, "bold")).pack(anchor=tk.W, padx=12, pady=(10, 6))
+    tk.Label(log_card, text="실행 로그", fg=TEXT_MAIN, bg=BG_CARD, font=("Malgun Gothic", 12, "bold")).pack(anchor=tk.W, padx=14, pady=(12, 8))
     log_text = scrolledtext.ScrolledText(
-        log_card, height=12, state=tk.DISABLED, wrap=tk.WORD, font=("Consolas", 9), bg="#0F172A", fg="#E2E8F0", insertbackground="white", relief=tk.FLAT, padx=10, pady=10
+        log_card, height=12, state=tk.DISABLED, wrap=tk.WORD, font=("Consolas", 10), bg=LOG_BG, fg=LOG_FG, insertbackground="white", relief=tk.FLAT, padx=12, pady=12
     )
     log_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
 
     # ——— 오른쪽: RSS 설정 + RSS 프롬프트 ———
     right_rss_col = tk.Frame(paned, bg=BG_MAIN)
-    paned.add(right_rss_col, minsize=300, width=400)
+    paned.add(right_rss_col, minsize=360, width=480)
     right_rss_paned = tk.PanedWindow(right_rss_col, orient=tk.VERTICAL, bg=BG_MAIN, sashwidth=6)
     right_rss_paned.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
 
@@ -1560,9 +1815,9 @@ def main_gui() -> None:
     tk.Label(rss_f, text="피드 URL 붙여넣기 후 추가", bg=BG_CARD, fg=TEXT_MUTED, font=("Malgun Gothic", 9)).pack(anchor=tk.W)
     rss_input_f = tk.Frame(rss_f, bg=BG_CARD)
     rss_input_f.pack(fill=tk.X, pady=(6, 6))
-    tk.Entry(rss_input_f, textvariable=var_rss_url_input, font=("Malgun Gothic", 9), relief=tk.FLAT, highlightthickness=1, highlightbackground=BORDER).pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6)
+    tk.Entry(rss_input_f, textvariable=var_rss_url_input, **_entry_kw).pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=6)
 
-    rss_urls_listbox = tk.Listbox(rss_f, height=6, font=("Malgun Gothic", 9), bg="#F8FAFC", relief=tk.FLAT, highlightthickness=1, highlightbackground=BORDER)
+    rss_urls_listbox = tk.Listbox(rss_f, height=6, font=("Malgun Gothic", 9), bg=INPUT_BG, relief=tk.FLAT, highlightthickness=2, highlightbackground=BORDER, selectbackground=ACCENT, selectforeground="white")
     rss_urls_listbox.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
     def _load_rss_urls_to_listbox() -> None:
@@ -1577,14 +1832,14 @@ def main_gui() -> None:
         url = var_rss_url_input.get().strip()
         if not url:
             return
-        data = load_gui_config()
+        data = load_gui_config(_get_profile())
         urls = data.get("rss_urls", [])
         if url in urls:
             messagebox.showinfo("중복 URL", "이미 등록된 RSS URL 입니다.")
             return
         urls.append(url)
         data["rss_urls"] = urls
-        save_gui_config(data)
+        save_gui_config(data, _get_profile())
         rss_urls_listbox.insert(tk.END, url)
         var_rss_url_input.set("")
 
@@ -1594,11 +1849,11 @@ def main_gui() -> None:
             return
         index = sel[0]
         url = rss_urls_listbox.get(index)
-        data = load_gui_config()
+        data = load_gui_config(_get_profile())
         urls = data.get("rss_urls", [])
         urls = [u for u in urls if u != url]
         data["rss_urls"] = urls
-        save_gui_config(data)
+        save_gui_config(data, _get_profile())
         rss_urls_listbox.delete(index)
 
     btn_rss_add = tk.Button(rss_input_f, text="추가", fg="white", bg=ACCENT, activebackground=ACCENT_DARK, font=("Malgun Gothic", 9), relief=tk.FLAT, padx=10, pady=4, cursor="hand2", command=add_rss_url)
@@ -1612,9 +1867,20 @@ def main_gui() -> None:
     if spinbox_boot:
         spinbox_boot(interval_f, textvariable=var_rss_check_interval, from_=1, to=24, width=4, bootstyle="primary").pack(side=tk.LEFT, padx=(8, 0))
     else:
-        tk.Spinbox(interval_f, textvariable=var_rss_check_interval, from_=1, to=24, width=4, font=("Malgun Gothic", 10)).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Spinbox(
+            interval_f,
+            textvariable=var_rss_check_interval,
+            from_=1,
+            to=24,
+            width=4,
+            font=("Malgun Gothic", 10),
+            relief=tk.FLAT,
+            highlightthickness=2,
+            highlightbackground=BORDER,
+            bg=INPUT_BG,
+        ).pack(side=tk.LEFT, padx=(8, 0), ipady=2)
 
-    chk_rss = dict(bg=BG_CARD, font=("Malgun Gothic", 9), activebackground=BG_CARD, selectcolor="#E0F2FE", fg=TEXT_MAIN, activeforeground=TEXT_MAIN)
+    chk_rss = dict(bg=BG_CARD, font=("Malgun Gothic", 9), activebackground=BG_CARD, selectcolor="#C7D2FE", fg=TEXT_MAIN, activeforeground=TEXT_MAIN)
     tk.Checkbutton(rss_f, text="감시 옵션 저장(시작은 하단 파란 버튼)", variable=var_rss_auto_enabled, **chk_rss).pack(anchor=tk.W, pady=(4, 0))
     tk.Checkbutton(rss_f, text="본문 말미 출처 링크 한 줄", variable=var_rss_include_source_link, **chk_rss).pack(anchor=tk.W, pady=(2, 0))
     tk.Checkbutton(rss_f, text="이미지는 본문에 넣지 않고 로그만", variable=var_rss_image_memo_only, **chk_rss).pack(anchor=tk.W, pady=(2, 4))
@@ -1629,18 +1895,18 @@ def main_gui() -> None:
     tk.Label(last_chk_f, textvariable=var_rss_last_checked, bg=BG_CARD, fg=ACCENT, font=("Malgun Gothic", 9, "bold")).pack(side=tk.LEFT, padx=(8, 0))
 
     rss_prompt_outer = tk.Frame(right_rss_paned, bg=BG_MAIN)
-    right_rss_paned.add(rss_prompt_outer, minsize=200)
-    rss_prompt_card = tk.Frame(rss_prompt_outer, bg=BG_CARD, highlightthickness=1, highlightbackground=BORDER)
+    right_rss_paned.add(rss_prompt_outer, minsize=240)
+    rss_prompt_card = tk.Frame(rss_prompt_outer, bg=BG_CARD, highlightthickness=2, highlightbackground=BORDER)
     rss_prompt_card.pack(fill=tk.BOTH, expand=True)
     tk.Label(
         rss_prompt_card,
         text="RSS 전용 프롬프트",
         fg=TEXT_MAIN,
         bg=BG_CARD,
-        font=("Malgun Gothic", 11, "bold"),
-    ).pack(anchor=tk.W, padx=12, pady=(12, 4))
+        font=("Malgun Gothic", 12, "bold"),
+    ).pack(anchor=tk.W, padx=14, pady=(14, 6))
     tk.Label(rss_prompt_card, text="시스템", bg=BG_CARD, fg=TEXT_MUTED, font=("Malgun Gothic", 9)).pack(anchor=tk.W, padx=12)
-    txt_prompt_rss_system = scrolledtext.ScrolledText(rss_prompt_card, height=4, wrap=tk.WORD, font=("Malgun Gothic", 9), bg="#F8FAFC", relief=tk.FLAT, padx=8, pady=8)
+    txt_prompt_rss_system = scrolledtext.ScrolledText(rss_prompt_card, height=4, wrap=tk.WORD, font=("Malgun Gothic", 9), bg=INPUT_BG, relief=tk.FLAT, padx=10, pady=10)
     txt_prompt_rss_system.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 6))
     tk.Label(
         rss_prompt_card,
@@ -1651,12 +1917,12 @@ def main_gui() -> None:
         justify=tk.LEFT,
         fg=TEXT_MUTED,
     ).pack(anchor=tk.W, padx=12)
-    txt_prompt_rss_user = scrolledtext.ScrolledText(rss_prompt_card, height=6, wrap=tk.WORD, font=("Malgun Gothic", 9), bg="#F8FAFC", relief=tk.FLAT, padx=8, pady=8)
+    txt_prompt_rss_user = scrolledtext.ScrolledText(rss_prompt_card, height=6, wrap=tk.WORD, font=("Malgun Gothic", 9), bg=INPUT_BG, relief=tk.FLAT, padx=10, pady=10)
     txt_prompt_rss_user.pack(fill=tk.BOTH, expand=True, padx=12, pady=(4, 8))
 
     # ——— 맨 오른쪽: 실시간 트렌드 & 뉴스 ———
     trends_col = tk.Frame(paned, bg=BG_MAIN)
-    paned.add(trends_col, minsize=260, width=320)
+    paned.add(trends_col, minsize=300, width=380)
     trends_f = section(trends_col, "실시간 트렌드 & 뉴스")
     trends_f.pack(fill=tk.BOTH, expand=True)
     var_trends_source = tk.StringVar(value="google_trends")
@@ -1668,7 +1934,7 @@ def main_gui() -> None:
     var_trends_source.trace_add("write", lambda *_: _refresh_trends())
     trends_btn_f = tk.Frame(trends_f, bg=BG_CARD)
     trends_btn_f.pack(fill=tk.X, pady=(4, 6))
-    trends_listbox = tk.Listbox(trends_f, height=14, font=("Malgun Gothic", 9), bg="#F8FAFC", relief=tk.FLAT, highlightthickness=1, highlightbackground=BORDER, selectmode=tk.SINGLE)
+    trends_listbox = tk.Listbox(trends_f, height=14, font=("Malgun Gothic", 9), bg=INPUT_BG, relief=tk.FLAT, highlightthickness=2, highlightbackground=BORDER, selectmode=tk.SINGLE, selectbackground=ACCENT, selectforeground="white")
     trends_listbox.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
     trends_full_items: list[str] = []
 
@@ -1713,7 +1979,7 @@ def main_gui() -> None:
     _refresh_trends()
 
     # ——— 트렌드 자동 글쓰기 (정해진/랜덤 간격으로 실검 1위·인기뉴스 1위 기반 글 작성) ———
-    trend_auto_f = tk.LabelFrame(trends_f, text="  트렌드 자동 글쓰기  ", fg=ACCENT, bg=BG_CARD, font=("Malgun Gothic", 9, "bold"), padx=10, pady=8, relief=tk.FLAT, highlightthickness=1, highlightbackground=BORDER)
+    trend_auto_f = tk.LabelFrame(trends_f, text="  트렌드 자동 글쓰기  ", fg=ACCENT, bg=BG_CARD, font=("Malgun Gothic", 9, "bold"), padx=12, pady=10, relief=tk.FLAT, highlightthickness=2, highlightbackground=BORDER)
     trend_auto_f.pack(fill=tk.X, pady=(12, 0))
     var_trend_auto_source = tk.StringVar(value="news_1")
     var_trend_auto_interval = tk.StringVar(value="3")
@@ -1726,11 +1992,12 @@ def main_gui() -> None:
     ta_int_f = tk.Frame(trend_auto_f, bg=BG_CARD)
     ta_int_f.pack(anchor=tk.W, pady=(4, 2))
     tk.Label(ta_int_f, text="간격(시간)", bg=BG_CARD, fg=TEXT_MUTED, font=("Malgun Gothic", 8)).pack(side=tk.LEFT)
-    tk.Entry(ta_int_f, textvariable=var_trend_auto_interval, width=4, font=("Malgun Gothic", 9)).pack(side=tk.LEFT, padx=(6, 8))
+    tk.Entry(ta_int_f, textvariable=var_trend_auto_interval, width=4, **_entry_kw).pack(side=tk.LEFT, padx=(6, 8))
     tk.Checkbutton(trend_auto_f, text="랜덤(2~6시간)", variable=var_trend_auto_random, bg=BG_CARD, font=("Malgun Gothic", 8), activebackground=BG_CARD, fg=TEXT_MAIN).pack(anchor=tk.W, pady=(0, 6))
 
-    def trend_auto_worker() -> None:
+    def trend_auto_worker(ta_profile: str | None = None) -> None:
         nonlocal trend_auto_stop_event
+        prof = ta_profile or _get_profile()
         stop_ev = trend_auto_stop_event
         log = log_msg
         naver_id = var_naver_id.get().strip()
@@ -1764,7 +2031,7 @@ def main_gui() -> None:
                 if topic:
                     try:
                         client = create_openai_client(api_key)
-                        gc = load_gui_config()
+                        gc = load_gui_config(prof)
                         sys_ov = (gc.get("prompt_hot_system") or "").strip() or None
                         suf_ov = (gc.get("prompt_hot_user_suffix") or "").strip() or None
                         title, content = generate_hot_issue_post(client, topic=topic, topic_mode="manual", trend_field="전체", system_override=sys_ov, user_suffix_override=suf_ov)
@@ -1790,7 +2057,7 @@ def main_gui() -> None:
             messagebox.showinfo("트렌드 자동", "이미 실행 중입니다.")
             return
         trend_auto_stop_event = threading.Event()
-        trend_auto_thread = threading.Thread(target=trend_auto_worker, daemon=True)
+        trend_auto_thread = threading.Thread(target=lambda: trend_auto_worker(_get_profile()), daemon=True)
         trend_auto_thread.start()
         log_msg("[트렌드 자동] ON — 간격마다 실검/인기뉴스 1위로 글 작성합니다. 끄려면 [트렌드 자동 OFF]를 누르세요.")
 
@@ -1811,7 +2078,7 @@ def main_gui() -> None:
     prompt_btn_rss_f.pack(fill=tk.X, padx=12, pady=(0, 12))
 
     def _load_prompt_widgets_from_config() -> None:
-        c = load_gui_config()
+        c = load_gui_config(_get_profile())
         hs = (c.get("prompt_hot_system") or "").strip()
         hu = (c.get("prompt_hot_user_suffix") or "").strip()
         rs = (c.get("prompt_rss_system") or "").strip()
@@ -1826,12 +2093,12 @@ def main_gui() -> None:
         txt_prompt_rss_user.insert(tk.END, ru or _default_rss_user_prompt_template())
 
     def _persist_prompts_silent() -> None:
-        data = load_gui_config()
+        data = load_gui_config(_get_profile())
         data["prompt_hot_system"] = txt_prompt_hot_system.get("1.0", tk.END).rstrip("\n")
         data["prompt_hot_user_suffix"] = txt_prompt_hot_user.get("1.0", tk.END).rstrip("\n")
         data["prompt_rss_system"] = txt_prompt_rss_system.get("1.0", tk.END).rstrip("\n")
         data["prompt_rss_user"] = txt_prompt_rss_user.get("1.0", tk.END).rstrip("\n")
-        save_gui_config(data)
+        save_gui_config(data, _get_profile())
 
     def save_prompts_to_config() -> None:
         _persist_prompts_silent()
@@ -1914,19 +2181,19 @@ def main_gui() -> None:
             log_text.configure(state=tk.DISABLED)
         root.after(0, _)
 
-    def _get_rss_urls_from_config() -> list[str]:
-        data = load_gui_config()
+    def _get_rss_urls_from_config(profile: str | None = None) -> list[str]:
+        data = load_gui_config(profile)
         urls = data.get("rss_urls", [])
         return [u for u in urls if isinstance(u, str) and u.strip()]
 
     def _save_rss_gui_options() -> None:
-        data = load_gui_config()
+        data = load_gui_config(_get_profile())
         data["rss_interval_hours"] = int(var_rss_check_interval.get().strip() or "3")
         data["rss_auto_enabled"] = bool(var_rss_auto_enabled.get())
         data["rss_include_source_link"] = bool(var_rss_include_source_link.get())
         data["rss_image_memo_only"] = bool(var_rss_image_memo_only.get())
         data["rss_publish_mode"] = var_rss_publish_mode.get()
-        save_gui_config(data)
+        save_gui_config(data, _get_profile())
 
     def run_click() -> None:
         nonlocal current_driver, manual_login_event
@@ -1963,9 +2230,10 @@ def main_gui() -> None:
         data["rss_include_source_link"] = bool(var_rss_include_source_link.get())
         data["rss_image_memo_only"] = bool(var_rss_image_memo_only.get())
         data["rss_publish_mode"] = var_rss_publish_mode.get()
-        save_gui_config(data)
+        save_gui_config(data, _get_profile())
         cfg = NaverConfig(naver_id=naver_id, naver_pw=naver_pw, openai_api_key=api_key, manual_login=var_manual.get(), blog_action=var_action.get())
         topic = var_topic.get().strip() or None
+        current_profile = _get_profile()
         manual_login_event = threading.Event()
         if cfg.manual_login:
             btn_manual_ok.configure(
@@ -1989,6 +2257,7 @@ def main_gui() -> None:
                 manual_login_event=manual_login_event,
                 hot_system=hs,
                 hot_user_suffix=hu,
+                profile=current_profile,
             )
             def after_run() -> None:
                 try:
@@ -2061,7 +2330,7 @@ def main_gui() -> None:
             messagebox.showwarning("입력 오류", "날짜는 YYYY-MM-DD, 시간은 HH:MM 형식으로 입력하세요.")
             return None
 
-    def schedule_worker() -> None:
+    def schedule_worker(schedule_profile: str) -> None:
         nonlocal schedule_cancel_event
         params = parse_schedule_params()
         if not params:
@@ -2116,7 +2385,7 @@ def main_gui() -> None:
 
             # 2순위: 큐가 비어 있으면 기존 topic 기반 자동 생성 실행
             manual_ev = threading.Event()
-            driver, err = run_blog_workflow(cfg, topic, log_fn=log_msg, manual_login_event=manual_ev)
+            driver, err = run_blog_workflow(cfg, topic, log_fn=log_msg, manual_login_event=manual_ev, profile=schedule_profile)
             if driver:
                 try:
                     driver.quit()
@@ -2138,7 +2407,7 @@ def main_gui() -> None:
         if schedule_cancel_event and schedule_cancel_event.is_set():
             schedule_cancel_event = None
         schedule_cancel_event = threading.Event()
-        data = load_gui_config()
+        data = load_gui_config(_get_profile())
         data["schedule_start"] = var_start_date.get().strip()
         data["schedule_end"] = var_end_date.get().strip()
         data["schedule_time_start"] = var_time_start.get().strip()
@@ -2156,9 +2425,9 @@ def main_gui() -> None:
         data["rss_include_source_link"] = bool(var_rss_include_source_link.get())
         data["rss_image_memo_only"] = bool(var_rss_image_memo_only.get())
         data["rss_publish_mode"] = var_rss_publish_mode.get()
-        save_gui_config(data)
+        save_gui_config(data, _get_profile())
         _persist_prompts_silent()
-        threading.Thread(target=schedule_worker, daemon=True).start()
+        threading.Thread(target=lambda: schedule_worker(_get_profile()), daemon=True).start()
         log_msg("예약을 시작합니다. 중지하려면 '예약 중지'를 누르세요.")
 
     def schedule_stop_click() -> None:
@@ -2221,12 +2490,12 @@ def main_gui() -> None:
         ev = rss_monitor_stop_event
         return ev is None or ev.is_set()
 
-    def _rss_run_single_scan_cycle(*, honor_global_stop: bool, log_cycle_done: bool) -> None:
+    def _rss_run_single_scan_cycle(*, honor_global_stop: bool, log_cycle_done: bool, rss_profile: str | None = None) -> None:
         """한 번의 피드 스캔 + 새 글 처리. 연속 감시 시 honor_global_stop=True 로 OFF 반영."""
         log = log_msg
         client: OpenAI | None = None
 
-        urls = _get_rss_urls_from_config()
+        urls = _get_rss_urls_from_config(rss_profile)
         if not urls:
             log("[RSS] 등록된 RSS URL 이 없습니다.")
             return
@@ -2317,7 +2586,7 @@ def main_gui() -> None:
                         return
 
                     try:
-                        gconf = load_gui_config()
+                        gconf = load_gui_config(rss_profile)
                         rss_sys = (gconf.get("prompt_rss_system") or "").strip() or None
                         rss_usr = (gconf.get("prompt_rss_user") or "").strip() or None
                         gen_title, gen_content = generate_post_from_rss(
@@ -2376,9 +2645,10 @@ def main_gui() -> None:
         if log_cycle_done:
             log("[RSS] 이번 피드 확인(1회)을 마쳤습니다.")
 
-    def rss_monitor_worker(single_pass: bool = False) -> None:
+    def rss_monitor_worker(single_pass: bool = False, rss_profile: str | None = None) -> None:
         """single_pass=True 이면 피드 1회만 확인 후 종료 (지금 RSS 확인용, OFF 상태에서도 동작)."""
         stop_ev = rss_monitor_stop_event
+        prof = rss_profile or _get_profile()
         log = log_msg
         try:
             if single_pass:
@@ -2386,14 +2656,14 @@ def main_gui() -> None:
                     log("[RSS] 이미 '지금 확인'이 실행 중입니다. 잠시 후 다시 시도하세요.")
                     return
                 try:
-                    _rss_run_single_scan_cycle(honor_global_stop=False, log_cycle_done=True)
+                    _rss_run_single_scan_cycle(honor_global_stop=False, log_cycle_done=True, rss_profile=prof)
                 finally:
                     rss_one_shot_lock.release()
                 return
             while True:
                 if stop_ev is None or stop_ev.is_set():
                     break
-                _rss_run_single_scan_cycle(honor_global_stop=True, log_cycle_done=False)
+                _rss_run_single_scan_cycle(honor_global_stop=True, log_cycle_done=False, rss_profile=prof)
                 if stop_ev is None or stop_ev.is_set():
                     log("[RSS] 감시가 중지되어 대기 루프에 들어가지 않습니다.")
                     break
@@ -2420,19 +2690,20 @@ def main_gui() -> None:
             return
         _save_rss_gui_options()
         _persist_prompts_silent()
-        urls = _get_rss_urls_from_config()
+        prof = _get_profile()
+        urls = _get_rss_urls_from_config(prof)
         if not urls:
             messagebox.showwarning("RSS", "먼저 RSS URL 을 하나 이상 등록하세요.")
             return
         rss_monitor_stop_event = threading.Event()
         rss_monitor_thread = threading.Thread(
-            target=lambda: rss_monitor_worker(single_pass=False), daemon=True
+            target=lambda: rss_monitor_worker(single_pass=False, rss_profile=prof), daemon=True
         )
         rss_monitor_thread.start()
         try:
-            gc = load_gui_config()
+            gc = load_gui_config(prof)
             gc["rss_auto_enabled"] = True
-            save_gui_config(gc)
+            save_gui_config(gc, prof)
             var_rss_auto_enabled.set(True)
         except Exception:
             pass
@@ -2443,9 +2714,9 @@ def main_gui() -> None:
         if rss_monitor_stop_event and not rss_monitor_stop_event.is_set():
             rss_monitor_stop_event.set()
             try:
-                data = load_gui_config()
+                data = load_gui_config(_get_profile())
                 data["rss_auto_enabled"] = False
-                save_gui_config(data)
+                save_gui_config(data, _get_profile())
                 var_rss_auto_enabled.set(False)
             except Exception:
                 pass
@@ -2459,18 +2730,18 @@ def main_gui() -> None:
 
     def rss_check_now() -> None:
         """연속 감시와 무관하게 피드만 1회 확인 (긴 대기 없음)."""
-        threading.Thread(target=lambda: rss_monitor_worker(single_pass=True), daemon=True).start()
+        threading.Thread(target=lambda: rss_monitor_worker(single_pass=True, rss_profile=_get_profile()), daemon=True).start()
         log_msg("[RSS] 피드 1회 확인을 시작했습니다…")
 
-    foot_btn = dict(relief=tk.FLAT, cursor="hand2", font=("Malgun Gothic", 10, "bold"), padx=16, pady=10, bd=0)
-    tk.Button(btn_frame, text="▶ 자동화 시작", fg="white", bg=ACCENT, activebackground=ACCENT_DARK, command=run_click, **foot_btn).pack(side=tk.LEFT, padx=(0, 6))
-    tk.Button(btn_frame, text="예약 시작", fg="white", bg=GREEN_BTN, activebackground=GREEN_DARK, command=schedule_start_click, **foot_btn).pack(side=tk.LEFT, padx=(0, 6))
-    tk.Button(btn_frame, text="예약 중지", fg="white", bg=ORANGE_BTN, activebackground="#C2410C", command=schedule_stop_click, **foot_btn).pack(side=tk.LEFT, padx=(0, 6))
-    tk.Frame(btn_frame, width=1, bg="#475569").pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=10)
-    tk.Button(btn_frame, text="RSS 감시 ON", fg="white", bg="#7C3AED", activebackground="#6D28D9", command=rss_start_monitor, **foot_btn).pack(side=tk.LEFT, padx=(0, 6))
-    tk.Button(btn_frame, text="RSS OFF", fg="white", bg=SLATE_BTN, activebackground="#334155", command=rss_stop_monitor, **foot_btn).pack(side=tk.LEFT, padx=(0, 6))
-    tk.Button(btn_frame, text="RSS 지금 확인", fg="white", bg="#0D9488", activebackground="#0F766E", command=rss_check_now, **foot_btn).pack(side=tk.LEFT, padx=(0, 6))
-    tk.Frame(btn_frame, width=1, bg="#475569").pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=10)
+    foot_btn = dict(relief=tk.FLAT, cursor="hand2", font=("Malgun Gothic", 10, "bold"), padx=18, pady=10, bd=0, activeforeground="white")
+    tk.Button(btn_frame, text="▶ 자동화 시작", fg="white", bg=ACCENT, activebackground=ACCENT_DARK, command=run_click, **foot_btn).pack(side=tk.LEFT, padx=(0, 8))
+    tk.Button(btn_frame, text="예약 시작", fg="white", bg=GREEN_BTN, activebackground=GREEN_DARK, command=schedule_start_click, **foot_btn).pack(side=tk.LEFT, padx=(0, 8))
+    tk.Button(btn_frame, text="예약 중지", fg="white", bg=ORANGE_BTN, activebackground="#D97706", command=schedule_stop_click, **foot_btn).pack(side=tk.LEFT, padx=(0, 8))
+    tk.Frame(btn_frame, width=1, bg="#4338CA").pack(side=tk.LEFT, fill=tk.Y, padx=12, pady=8)
+    tk.Button(btn_frame, text="RSS 감시 ON", fg="white", bg="#8B5CF6", activebackground="#7C3AED", command=rss_start_monitor, **foot_btn).pack(side=tk.LEFT, padx=(0, 8))
+    tk.Button(btn_frame, text="RSS OFF", fg="white", bg=SLATE_BTN, activebackground="#334155", command=rss_stop_monitor, **foot_btn).pack(side=tk.LEFT, padx=(0, 8))
+    tk.Button(btn_frame, text="RSS 지금 확인", fg="white", bg="#0D9488", activebackground="#0F766E", command=rss_check_now, **foot_btn).pack(side=tk.LEFT, padx=(0, 8))
+    tk.Frame(btn_frame, width=1, bg="#4338CA").pack(side=tk.LEFT, fill=tk.Y, padx=12, pady=8)
 
     def do_stop() -> None:
         nonlocal current_driver
@@ -2482,14 +2753,14 @@ def main_gui() -> None:
             current_driver = None
             log_msg("중지되었습니다. 브라우저를 닫았습니다.")
 
-    tk.Button(btn_frame, text="브라우저 중지", fg="white", bg=RED_BTN, activebackground="#B91C1C", command=do_stop, **foot_btn).pack(side=tk.LEFT, padx=(0, 10))
+    tk.Button(btn_frame, text="브라우저 중지", fg="white", bg=RED_BTN, activebackground="#DC2626", command=do_stop, **foot_btn).pack(side=tk.LEFT, padx=(0, 12))
 
     manual_wrap = tk.Frame(btn_frame, bg=BG_FOOTER)
     manual_wrap.pack(side=tk.LEFT, padx=(8, 0))
     tk.Label(
         manual_wrap,
         text="수동 로그인 모드일 때만 켜짐 →",
-        fg="#94A3B8",
+        fg="#A5B4FC",
         bg=BG_FOOTER,
         font=("Malgun Gothic", 9),
     ).pack(side=tk.LEFT, padx=(0, 8))
@@ -2523,7 +2794,7 @@ def main_gui() -> None:
     btn_manual_ok.pack(side=tk.LEFT)
 
     def load_saved_if_needed() -> None:
-        c = load_gui_config()
+        c = load_gui_config(_get_profile())
         if c.get("save_login", True):
             var_naver_id.set(c.get("naver_id", ""))
             var_naver_pw.set(c.get("naver_pw", ""))

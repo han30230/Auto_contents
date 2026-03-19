@@ -19,6 +19,10 @@ dist/
 *_config.json
 *_cookies.json
 
+# Runtime state
+rss_state.json
+rss_queue.json
+
 # IDE
 .idea/
 .vscode/
